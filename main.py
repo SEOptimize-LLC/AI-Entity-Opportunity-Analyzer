@@ -11,8 +11,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import validators
 
+# Fixed import - using original filename
 from analysis_engine import AIEntityAnalyzer
-from data_models_simple import AnalysisReport
+from data_models import AnalysisReport
 
 # Page configuration
 st.set_page_config(
