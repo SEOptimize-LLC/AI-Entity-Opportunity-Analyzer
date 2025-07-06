@@ -1,0 +1,6 @@
+venv
+archive
+service_account.json
+output
+__pycache__
+.env
