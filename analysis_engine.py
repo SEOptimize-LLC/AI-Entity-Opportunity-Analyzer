@@ -17,7 +17,7 @@ from asyncio_throttle import Throttler
 from loguru import logger
 import streamlit as st
 
-# Fixed import - using original filename
+# Correct import - using original filename
 from data_models import (
     EntityAnalysis, ContentAnalysis, OpportunityEntity, 
     IntegrationRecommendation, AnalysisReport
@@ -51,52 +51,90 @@ class AIEntityAnalyzer:
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def scrape_content(self, url: str) -> Optional[Dict[str, str]]:
-        """Scrape content from a URL with retry logic."""
+        """Enhanced scraping with better error reporting."""
         try:
             if not validators.url(url):
-                logger.error(f"Invalid URL: {url}")
-                return None
+                logger.error(f"Invalid URL format: {url}")
+                raise ValueError(f"Invalid URL format: {url}")
             
             async with RATE_LIMITER:
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
                 }
                 
-                timeout = aiohttp.ClientTimeout(total=30)
-                async with self.session.get(url, headers=headers, timeout=timeout) as response:
-                    if response.status != 200:
-                        logger.warning(f"HTTP {response.status} for {url}")
-                        return None
-                    
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    # Extract title
-                    title_tag = soup.find('title')
-                    title = title_tag.get_text().strip() if title_tag else "No title found"
-                    
-                    # Remove unwanted elements
-                    for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
-                        tag.decompose()
-                    
-                    # Extract main content
-                    content = soup.get_text(separator=' ', strip=True)
-                    content = re.sub(r'\s+', ' ', content)
-                    
-                    # Basic content validation
-                    if len(content.split()) < 50:
-                        logger.warning(f"Content too short for {url}")
-                        return None
-                    
-                    return {
-                        'url': url,
-                        'title': title,
-                        'content': content,
-                        'word_count': len(content.split())
-                    }
-                    
+                timeout = aiohttp.ClientTimeout(total=45)  # Increased timeout
+                
+                try:
+                    async with self.session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as response:
+                        if response.status == 403:
+                            logger.warning(f"Access forbidden (403) for {url} - website may be blocking scrapers")
+                            return None
+                        elif response.status == 404:
+                            logger.warning(f"Page not found (404) for {url}")
+                            return None
+                        elif response.status != 200:
+                            logger.warning(f"HTTP {response.status} for {url}")
+                            return None
+                        
+                        # Check content type
+                        content_type = response.headers.get('content-type', '').lower()
+                        if 'text/html' not in content_type:
+                            logger.warning(f"Non-HTML content type for {url}: {content_type}")
+                            return None
+                        
+                        html = await response.text()
+                        
+                        # Check for anti-bot protection
+                        if any(phrase in html.lower() for phrase in ['cloudflare', 'captcha', 'bot detection', 'access denied']):
+                            logger.warning(f"Bot protection detected for {url}")
+                            return None
+                        
+                        soup = BeautifulSoup(html, 'html.parser')
+                        
+                        # Extract title
+                        title_tag = soup.find('title')
+                        title = title_tag.get_text().strip() if title_tag else f"Page from {urlparse(url).netloc}"
+                        
+                        # Remove unwanted elements
+                        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript']):
+                            tag.decompose()
+                        
+                        # Extract main content
+                        content = soup.get_text(separator=' ', strip=True)
+                        content = re.sub(r'\s+', ' ', content)
+                        
+                        # Enhanced content validation
+                        word_count = len(content.split())
+                        if word_count < 100:
+                            logger.warning(f"Content too short for meaningful analysis: {url} ({word_count} words)")
+                            return None
+                        
+                        logger.info(f"Successfully scraped {word_count} words from {url}")
+                        
+                        return {
+                            'url': url,
+                            'title': title,
+                            'content': content,
+                            'word_count': word_count
+                        }
+                        
+                except aiohttp.ClientConnectorError as e:
+                    logger.error(f"Connection error for {url}: {str(e)}")
+                    return None
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout error for {url}")
+                    return None
+                except Exception as e:
+                    logger.error(f"Unexpected error scraping {url}: {str(e)}")
+                    return None
+                        
         except Exception as e:
-            logger.error(f"Error scraping {url}: {str(e)}")
+            logger.error(f"Error in scrape_content for {url}: {str(e)}")
             return None
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -350,6 +388,7 @@ class AIEntityAnalyzer:
             
             # Scrape and analyze competitors
             competitor_analyses = []
+            successfully_scraped_urls = []
             for i, comp_url in enumerate(competitor_urls):
                 if progress_callback:
                     progress_callback(f"Analyzing competitor {i+1}/{len(competitor_urls)}...")
@@ -359,6 +398,7 @@ class AIEntityAnalyzer:
                     comp_analysis = await self.analyze_content_with_ai(comp_content)
                     if comp_analysis:
                         competitor_analyses.append(comp_analysis)
+                        successfully_scraped_urls.append(comp_url)
             
             if not competitor_analyses:
                 raise Exception("Failed to analyze any competitor content")
@@ -378,7 +418,7 @@ class AIEntityAnalyzer:
                 analysis_id=analysis_id,
                 timestamp=datetime.now(),
                 client_url=client_url,
-                competitor_urls=[comp.url for comp in competitor_analyses],
+                competitor_urls=successfully_scraped_urls,  # Use only successful URLs
                 client_analysis=client_analysis,
                 competitor_analyses=competitor_analyses,
                 missing_entities=opportunities,
