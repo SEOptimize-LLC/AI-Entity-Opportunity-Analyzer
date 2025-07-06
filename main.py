@@ -11,7 +11,6 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import validators
 
-# Fixed import - using original filename
 from analysis_engine import AIEntityAnalyzer
 from data_models import AnalysisReport
 
@@ -49,6 +48,14 @@ st.markdown("""
         border-radius: 0.5rem;
         margin: 1rem 0;
     }
+    .warning-box {
+        background-color: #fff3cd;
+        border: 1px solid #ffeaa7;
+        color: #856404;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
     .metric-container {
         background-color: #f8f9fa;
         padding: 1rem;
@@ -68,6 +75,10 @@ class SEOAnalyzerApp:
             st.session_state.analysis_report = None
         if 'analysis_history' not in st.session_state:
             st.session_state.analysis_history = []
+        if 'form_submitted' not in st.session_state:
+            st.session_state.form_submitted = False
+        if 'analysis_running' not in st.session_state:
+            st.session_state.analysis_running = False
     
     def validate_api_key(self) -> bool:
         """Validate OpenAI API key."""
@@ -99,6 +110,7 @@ class SEOAnalyzerApp:
                 for i, analysis in enumerate(st.session_state.analysis_history[-3:]):
                     if st.button(f"📊 Analysis {i+1}", key=f"load_{i}"):
                         st.session_state.analysis_report = analysis
+                        st.session_state.form_submitted = False
                         st.rerun()
             
             st.markdown("---")
@@ -111,6 +123,15 @@ class SEOAnalyzerApp:
                 st.metric("Priority Items", report.priority_opportunities)
                 st.metric("Competitors", len(report.competitor_analyses))
             
+            # Reset button
+            if st.session_state.analysis_report or st.session_state.form_submitted:
+                st.markdown("---")
+                if st.button("🔄 Start New Analysis", type="secondary"):
+                    st.session_state.analysis_report = None
+                    st.session_state.form_submitted = False
+                    st.session_state.analysis_running = False
+                    st.rerun()
+            
             st.markdown("---")
             st.markdown("### ℹ️ About")
             st.info(
@@ -119,76 +140,203 @@ class SEOAnalyzerApp:
             )
     
     def render_input_form(self):
-        """Render the main input form."""
+        """Render the main input form with improved handling."""
         st.markdown("## 🌐 Enter URLs for Analysis")
         
-        with st.form("analysis_form"):
-            # Client URL
-            client_url = st.text_input(
-                "Your Website URL",
-                placeholder="https://your-website.com",
-                help="Enter the URL of the page you want to analyze"
+        # Show warning if analysis is running
+        if st.session_state.analysis_running:
+            st.warning("⏳ Analysis in progress... Please wait for completion.")
+            return
+        
+        # Initialize form state
+        if 'client_url' not in st.session_state:
+            st.session_state.client_url = ""
+        if 'competitor_urls' not in st.session_state:
+            st.session_state.competitor_urls = ["", "", ""]
+        
+        # Client URL input
+        st.markdown("### 🏠 Your Website")
+        client_url = st.text_input(
+            "Your Website URL",
+            value=st.session_state.client_url,
+            placeholder="https://your-website.com",
+            help="Enter the URL of the page you want to analyze",
+            key="client_url_input"
+        )
+        
+        # Update session state
+        st.session_state.client_url = client_url
+        
+        # Competitor URLs
+        st.markdown("### 🏢 Competitor URLs")
+        st.info("💡 **Tip**: Enter at least 2 competitor URLs for meaningful analysis. All URLs will be validated before analysis starts.")
+        
+        competitor_urls = []
+        for i in range(3):
+            url = st.text_input(
+                f"Competitor {i+1} URL",
+                value=st.session_state.competitor_urls[i] if i < len(st.session_state.competitor_urls) else "",
+                placeholder=f"https://competitor{i+1}.com",
+                key=f"comp_url_{i}"
+            )
+            if url.strip():
+                competitor_urls.append(url.strip())
+            
+            # Update session state
+            if i < len(st.session_state.competitor_urls):
+                st.session_state.competitor_urls[i] = url
+        
+        # Analysis options
+        st.markdown("### ⚙️ Analysis Options")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            detailed_analysis = st.checkbox("Detailed Analysis Mode", value=False, help="More thorough analysis but takes longer")
+        
+        with col2:
+            max_opportunities = st.selectbox("Max Opportunities to Find", [5, 10, 15, 20], index=1)
+        
+        st.markdown("---")
+        
+        # Validation and submit section
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            # Real-time validation display
+            validation_messages = []
+            
+            if not client_url:
+                validation_messages.append("❌ Client URL is required")
+            elif not validators.url(client_url):
+                validation_messages.append("❌ Client URL format is invalid")
+            else:
+                validation_messages.append("✅ Client URL is valid")
+            
+            if len(competitor_urls) < 2:
+                validation_messages.append("❌ At least 2 competitor URLs are required")
+            else:
+                valid_competitors = [url for url in competitor_urls if validators.url(url)]
+                invalid_competitors = [url for url in competitor_urls if not validators.url(url)]
+                
+                validation_messages.append(f"✅ {len(valid_competitors)} valid competitor URLs")
+                if invalid_competitors:
+                    validation_messages.append(f"❌ {len(invalid_competitors)} invalid competitor URLs")
+            
+            # Display validation status
+            for msg in validation_messages:
+                if "❌" in msg:
+                    st.error(msg)
+                else:
+                    st.success(msg)
+        
+        with col2:
+            # Submit button
+            can_submit = (
+                client_url and 
+                validators.url(client_url) and 
+                len([url for url in competitor_urls if validators.url(url)]) >= 2 and
+                not st.session_state.analysis_running
             )
             
-            # Competitor URLs
-            st.markdown("### 🏢 Competitor URLs")
-            num_competitors = st.slider("Number of Competitors", 1, 5, 3)
-            
-            competitor_urls = []
-            for i in range(num_competitors):
-                url = st.text_input(
-                    f"Competitor {i+1} URL",
-                    key=f"comp_{i}",
-                    placeholder=f"https://competitor{i+1}.com"
-                )
-                if url.strip():
-                    competitor_urls.append(url.strip())
-            
-            # Submit button
-            submitted = st.form_submit_button("🚀 Start Analysis", use_container_width=True)
-            
-            if submitted:
-                if not client_url:
-                    st.error("Please enter your website URL")
-                    return
+            if st.button(
+                "🚀 Start Analysis", 
+                disabled=not can_submit,
+                use_container_width=True,
+                type="primary"
+            ):
+                # Validate one more time before submission
+                valid_competitor_urls = [url for url in competitor_urls if validators.url(url)]
                 
-                if not competitor_urls:
-                    st.error("Please enter at least one competitor URL")
-                    return
-                
-                # Validate URLs
-                all_urls = [client_url] + competitor_urls
-                invalid_urls = [url for url in all_urls if not validators.url(url)]
-                
-                if invalid_urls:
-                    st.error(f"Invalid URLs: {', '.join(invalid_urls)}")
-                    return
-                
-                # Run analysis
-                self.run_analysis(client_url, competitor_urls)
+                if client_url and validators.url(client_url) and len(valid_competitor_urls) >= 2:
+                    st.session_state.form_submitted = True
+                    st.session_state.analysis_running = True
+                    self.run_analysis(client_url, valid_competitor_urls, detailed_analysis, max_opportunities)
+                else:
+                    st.error("❌ Please fix validation errors before submitting")
     
-    def run_analysis(self, client_url: str, competitor_urls: list):
-        """Run the analysis with progress tracking."""
-        # Progress tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    def run_analysis(self, client_url: str, competitor_urls: list, detailed_analysis: bool = False, max_opportunities: int = 10):
+        """Run the analysis with comprehensive progress tracking and error handling."""
         
-        def update_progress(message: str):
-            status_text.text(message)
+        # Create analysis container
+        analysis_container = st.container()
+        
+        with analysis_container:
+            st.markdown("## 🔄 Analysis in Progress")
+            
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            details_container = st.container()
+            
+            # Error tracking
+            errors = []
+            warnings = []
+            
+            def update_progress(message: str, progress: float = None):
+                status_text.text(f"🔍 {message}")
+                if progress is not None:
+                    progress_bar.progress(min(100, int(progress * 100)))
+            
+            def log_error(error_msg: str):
+                errors.append(error_msg)
+                with details_container:
+                    st.error(f"❌ {error_msg}")
+            
+            def log_warning(warning_msg: str):
+                warnings.append(warning_msg)
+                with details_container:
+                    st.warning(f"⚠️ {warning_msg}")
+            
+            def log_success(success_msg: str):
+                with details_container:
+                    st.success(f"✅ {success_msg}")
         
         try:
             # Get API key
             api_key = st.secrets.get("OPENAI_API_KEY")
             if not api_key:
-                st.error("OpenAI API key not found")
+                log_error("OpenAI API key not found in secrets")
+                st.session_state.analysis_running = False
                 return
             
-            # Run analysis
+            log_success("API key validated successfully")
+            update_progress("Initializing analysis engine...", 0.1)
+            
+            # Run analysis with detailed tracking
             async def run_async_analysis():
                 async with AIEntityAnalyzer(api_key) as analyzer:
-                    return await analyzer.run_complete_analysis(
-                        client_url, competitor_urls, update_progress
-                    )
+                    try:
+                        # Enhanced progress callback
+                        def enhanced_progress_callback(message: str):
+                            if "scraping" in message.lower():
+                                update_progress(message, 0.2)
+                            elif "analyzing client" in message.lower():
+                                update_progress(message, 0.4)
+                            elif "analyzing competitor" in message.lower():
+                                update_progress(message, 0.6)
+                            elif "identifying" in message.lower():
+                                update_progress(message, 0.8)
+                            elif "generating" in message.lower():
+                                update_progress(message, 0.9)
+                            elif "complete" in message.lower():
+                                update_progress(message, 1.0)
+                            else:
+                                update_progress(message)
+                        
+                        # Start analysis
+                        update_progress("Starting comprehensive analysis...", 0.1)
+                        log_success(f"Analyzing client: {client_url}")
+                        log_success(f"Analyzing {len(competitor_urls)} competitors")
+                        
+                        report = await analyzer.run_complete_analysis(
+                            client_url, competitor_urls, enhanced_progress_callback
+                        )
+                        
+                        return report
+                        
+                    except Exception as e:
+                        log_error(f"Analysis engine error: {str(e)}")
+                        return None
             
             # Execute async analysis
             loop = asyncio.new_event_loop()
@@ -198,23 +346,86 @@ class SEOAnalyzerApp:
             finally:
                 loop.close()
             
+            # Process results
             if report:
-                st.session_state.analysis_report = report
-                st.session_state.analysis_history.append(report)
+                # Analysis successful
                 progress_bar.progress(100)
                 status_text.success("✅ Analysis completed successfully!")
-                st.rerun()
-            else:
-                st.error("❌ Analysis failed. Please check your URLs and try again.")
                 
+                # Store results
+                st.session_state.analysis_report = report
+                st.session_state.analysis_history.append(report)
+                st.session_state.form_submitted = True
+                st.session_state.analysis_running = False
+                
+                # Show summary
+                with details_container:
+                    st.markdown("### 📊 Analysis Summary")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Client Words", report.client_analysis.word_count)
+                    
+                    with col2:
+                        st.metric("Competitors Analyzed", len(report.competitor_analyses))
+                    
+                    with col3:
+                        st.metric("Opportunities Found", report.total_opportunities)
+                    
+                    with col4:
+                        st.metric("Priority Items", report.priority_opportunities)
+                    
+                    # Analysis quality check
+                    if report.total_opportunities == 0:
+                        st.warning("⚠️ **No opportunities found!** This could indicate:")
+                        st.markdown("""
+                        - Your content is already well-optimized compared to competitors
+                        - Competitors have similar content strategies
+                        - Analysis parameters may need adjustment
+                        - Consider analyzing different competitor pages or industries
+                        """)
+                    
+                    if len(report.competitor_analyses) < len(competitor_urls):
+                        failed_count = len(competitor_urls) - len(report.competitor_analyses)
+                        st.warning(f"⚠️ **{failed_count} competitor(s) failed to analyze** - they may be blocking scraping or have accessibility issues")
+                
+                # Auto-scroll to results
+                st.rerun()
+                
+            else:
+                # Analysis failed
+                log_error("Analysis failed to complete successfully")
+                st.session_state.analysis_running = False
+                
+                with details_container:
+                    st.markdown("### 🔧 Troubleshooting Tips")
+                    st.info("""
+                    **Common issues and solutions:**
+                    - **URL Access**: Ensure all URLs are publicly accessible
+                    - **Content Length**: Pages with very little text content may not analyze well
+                    - **Rate Limits**: If you see rate limit errors, wait a few minutes and try again
+                    - **API Quota**: Check your OpenAI account for available credits
+                    """)
+                    
+                    if st.button("🔄 Retry Analysis"):
+                        st.session_state.analysis_running = False
+                        st.rerun()
+                        
         except Exception as e:
-            st.error(f"❌ Error during analysis: {str(e)}")
-        finally:
-            progress_bar.empty()
-            status_text.empty()
+            log_error(f"Unexpected error during analysis: {str(e)}")
+            st.session_state.analysis_running = False
+            
+            with details_container:
+                st.markdown("### 🆘 Error Details")
+                st.code(str(e))
+                
+                if st.button("🔄 Reset and Try Again"):
+                    st.session_state.analysis_running = False
+                    st.session_state.form_submitted = False
+                    st.rerun()
     
     def render_results(self):
-        """Render analysis results."""
+        """Render analysis results with enhanced debugging info."""
         if not st.session_state.analysis_report:
             return
         
@@ -222,7 +433,7 @@ class SEOAnalyzerApp:
         
         st.markdown("## 📊 Analysis Results")
         
-        # Summary metrics
+        # Enhanced summary metrics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Opportunities", report.total_opportunities)
@@ -232,6 +443,24 @@ class SEOAnalyzerApp:
             st.metric("Competitors Analyzed", len(report.competitor_analyses))
         with col4:
             st.metric("Client Word Count", report.client_analysis.word_count)
+        
+        # Debug information
+        with st.expander("🔍 Debug Information"):
+            st.markdown("**Analysis Metadata:**")
+            st.json({
+                "analysis_id": report.analysis_id,
+                "timestamp": report.timestamp.isoformat(),
+                "client_url": report.client_url,
+                "competitor_urls_submitted": len(report.competitor_urls),
+                "competitor_analyses_completed": len(report.competitor_analyses),
+                "client_entities_found": len(report.client_analysis.entities),
+                "total_competitor_entities": sum(len(comp.entities) for comp in report.competitor_analyses),
+                "opportunities_found": len(report.missing_entities),
+                "recommendations_generated": len(report.recommendations)
+            })
+            
+            if len(report.competitor_analyses) != len(report.competitor_urls):
+                st.warning("⚠️ Some competitors failed to analyze - check URLs for accessibility")
         
         # Tabs for different views
         tab1, tab2, tab3, tab4 = st.tabs(["🎯 Opportunities", "📋 Recommendations", "📈 Visualizations", "📁 Export"])
@@ -249,15 +478,23 @@ class SEOAnalyzerApp:
             self.render_export_tab(report)
     
     def render_opportunities_tab(self, report: AnalysisReport):
-        """Render opportunities tab."""
+        """Render opportunities tab with better insights."""
         st.markdown("### 🎯 SEO Opportunities Found")
         
         if not report.missing_entities:
-            st.info("No opportunities found. Your content might already be well-optimized!")
+            st.info("🎉 **No opportunities found!** This could mean:")
+            st.markdown("""
+            - ✅ Your content is already well-optimized compared to these competitors
+            - ✅ You're covering the same key topics and entities as your competitors
+            - 🔄 Try analyzing different competitors in your industry
+            - 🔄 Consider analyzing competitor pages that rank higher for your target keywords
+            """)
             return
         
+        st.markdown(f"Found **{len(report.missing_entities)} optimization opportunities** by analyzing competitor content:")
+        
         for i, opportunity in enumerate(report.missing_entities, 1):
-            with st.expander(f"{i}. {opportunity.name} (Score: {opportunity.relevance_score:.2f})"):
+            with st.expander(f"{i}. {opportunity.name} (Relevance: {opportunity.relevance_score:.2f})"):
                 col1, col2 = st.columns(2)
                 
                 with col1:
@@ -268,17 +505,24 @@ class SEOAnalyzerApp:
                 with col2:
                     st.markdown(f"**Found in {len(opportunity.found_in_competitors)} competitors:**")
                     for comp_url in opportunity.found_in_competitors:
-                        st.markdown(f"• {comp_url}")
+                        st.markdown(f"• {comp_url[:50]}{'...' if len(comp_url) > 50 else ''}")
                 
-                st.markdown(f"**Why this is an opportunity:** {opportunity.reasoning}")
+                st.markdown(f"**💡 Why this is an opportunity:** {opportunity.reasoning}")
     
     def render_recommendations_tab(self, report: AnalysisReport):
         """Render recommendations tab."""
         st.markdown("### 🚀 AI-Powered Recommendations")
         
         if not report.recommendations:
-            st.info("No specific recommendations available.")
+            st.info("No specific recommendations available. This can happen when:")
+            st.markdown("""
+            - No clear opportunities were identified in the analysis
+            - The content analysis didn't find sufficient differences between your page and competitors
+            - The AI model encountered issues generating specific recommendations
+            """)
             return
+        
+        st.markdown(f"**{len(report.recommendations)} actionable recommendations** to improve your content:")
         
         for i, rec in enumerate(report.recommendations, 1):
             st.markdown(f"### {i}. {rec.entity_name}")
