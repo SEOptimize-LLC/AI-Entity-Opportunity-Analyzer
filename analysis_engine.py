@@ -17,7 +17,8 @@ from asyncio_throttle import Throttler
 from loguru import logger
 import streamlit as st
 
-from data_models_simple import (
+# Fixed import - using original filename
+from data_models import (
     EntityAnalysis, ContentAnalysis, OpportunityEntity, 
     IntegrationRecommendation, AnalysisReport
 )
