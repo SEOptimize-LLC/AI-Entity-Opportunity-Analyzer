@@ -1,5 +1,4 @@
 import asyncio
-import aiohttp
 import json
 import uuid
 from datetime import datetime
@@ -13,9 +12,10 @@ import validators
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
-from asyncio_throttle import Throttler
 from loguru import logger
 import streamlit as st
+import httpx
+import time
 
 # Correct import - using original filename
 from data_models import (
@@ -24,7 +24,24 @@ from data_models import (
 )
 
 # Rate limiting: 1 request per 2 seconds to be respectful
-RATE_LIMITER = Throttler(rate_limit=1, period=2)
+class RateLimiter:
+    def __init__(self, rate_limit: int = 1, period: int = 2):
+        self.rate_limit = rate_limit
+        self.period = period
+        self.last_request = 0
+    
+    async def __aenter__(self):
+        current_time = time.time()
+        time_since_last = current_time - self.last_request
+        if time_since_last < self.period:
+            await asyncio.sleep(self.period - time_since_last)
+        self.last_request = time.time()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+RATE_LIMITER = RateLimiter(rate_limit=1, period=2)
 
 # Common stop words to filter out
 STOP_WORDS = {
@@ -38,20 +55,26 @@ class AIEntityAnalyzer:
     """Main analyzer class that uses only OpenAI for all analysis."""
     
     def __init__(self, api_key: str):
-        self.client = AsyncOpenAI(api_key=api_key)
-        self.session = None
+        self.openai_client = AsyncOpenAI(api_key=api_key)
+        self.http_client = None
     
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
+        # Create httpx client with proper configuration
+        self.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(45.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+            follow_redirects=True,
+            verify=False  # Allow self-signed certificates
+        )
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+        if self.http_client:
+            await self.http_client.aclose()
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def scrape_content(self, url: str) -> Optional[Dict[str, str]]:
-        """Enhanced scraping with anti-detection measures and better error handling."""
+        """Enhanced scraping with httpx and better error handling."""
         try:
             if not validators.url(url):
                 logger.error(f"Invalid URL format: {url}")
@@ -75,178 +98,146 @@ class AIEntityAnalyzer:
                     'Pragma': 'no-cache'
                 }
                 
-                timeout = aiohttp.ClientTimeout(total=45)  # Increased timeout
-                
                 try:
-                    # Use connector with better SSL handling
-                    connector = aiohttp.TCPConnector(
-                        limit=10,
-                        limit_per_host=5,
-                        ttl_dns_cache=300,
-                        use_dns_cache=True,
-                        enable_cleanup_closed=True
-                    )
+                    response = await self.http_client.get(url, headers=headers)
                     
-                    # Create session with connector if not already created
-                    if not hasattr(self.session, '_connector') or self.session.closed:
-                        self.session = aiohttp.ClientSession(connector=connector)
+                    # Enhanced status code handling
+                    if response.status_code == 403:
+                        logger.warning(f"Access forbidden (403) for {url} - website may be blocking scrapers")
+                        return None
+                    elif response.status_code == 404:
+                        logger.warning(f"Page not found (404) for {url}")
+                        return None
+                    elif response.status_code == 429:
+                        logger.warning(f"Rate limited (429) for {url} - too many requests")
+                        return None
+                    elif response.status_code == 503:
+                        logger.warning(f"Service unavailable (503) for {url}")
+                        return None
+                    elif response.status_code != 200:
+                        logger.warning(f"HTTP {response.status_code} for {url}")
+                        return None
                     
-                    async with self.session.get(
-                        url, 
-                        headers=headers, 
-                        timeout=timeout, 
-                        allow_redirects=True,
-                        max_redirects=10,
-                        ssl=False  # Allow self-signed certificates
-                    ) as response:
-                        
-                        # Enhanced status code handling
-                        if response.status == 403:
-                            logger.warning(f"Access forbidden (403) for {url} - website may be blocking scrapers")
-                            return None
-                        elif response.status == 404:
-                            logger.warning(f"Page not found (404) for {url}")
-                            return None
-                        elif response.status == 429:
-                            logger.warning(f"Rate limited (429) for {url} - too many requests")
-                            return None
-                        elif response.status == 503:
-                            logger.warning(f"Service unavailable (503) for {url}")
-                            return None
-                        elif response.status != 200:
-                            logger.warning(f"HTTP {response.status} for {url}")
-                            return None
-                        
-                        # Check content type
-                        content_type = response.headers.get('content-type', '').lower()
-                        if 'text/html' not in content_type and 'application/xhtml' not in content_type:
-                            logger.warning(f"Non-HTML content type for {url}: {content_type}")
-                            return None
-                        
-                        # Read content with proper encoding handling
-                        try:
-                            html = await response.text(encoding='utf-8')
-                        except UnicodeDecodeError:
-                            # Fallback to different encodings
-                            try:
-                                html = await response.text(encoding='latin-1')
-                            except:
-                                html = await response.text(errors='ignore')
-                        
-                        # Check for anti-bot protection
-                        html_lower = html.lower()
-                        bot_detection_phrases = [
-                            'cloudflare', 'captcha', 'bot detection', 'access denied',
-                            'blocked', 'security check', 'are you human', 'verification',
-                            'suspicious activity', 'automated traffic'
-                        ]
-                        
-                        if any(phrase in html_lower for phrase in bot_detection_phrases):
-                            logger.warning(f"Bot protection detected for {url}")
-                            return None
-                        
-                        # Check for minimal content (likely error pages)
-                        if len(html) < 500:
-                            logger.warning(f"Response too short for {url}: {len(html)} characters")
-                            return None
-                        
-                        soup = BeautifulSoup(html, 'html.parser')
-                        
-                        # Extract title with multiple fallbacks
-                        title = "No title found"
-                        title_tag = soup.find('title')
-                        if title_tag:
-                            title = title_tag.get_text().strip()
+                    # Check content type
+                    content_type = response.headers.get('content-type', '').lower()
+                    if 'text/html' not in content_type and 'application/xhtml' not in content_type:
+                        logger.warning(f"Non-HTML content type for {url}: {content_type}")
+                        return None
+                    
+                    # Get HTML content
+                    html = response.text
+                    
+                    # Check for anti-bot protection
+                    html_lower = html.lower()
+                    bot_detection_phrases = [
+                        'cloudflare', 'captcha', 'bot detection', 'access denied',
+                        'blocked', 'security check', 'are you human', 'verification',
+                        'suspicious activity', 'automated traffic'
+                    ]
+                    
+                    if any(phrase in html_lower for phrase in bot_detection_phrases):
+                        logger.warning(f"Bot protection detected for {url}")
+                        return None
+                    
+                    # Check for minimal content (likely error pages)
+                    if len(html) < 500:
+                        logger.warning(f"Response too short for {url}: {len(html)} characters")
+                        return None
+                    
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    # Extract title with multiple fallbacks
+                    title = "No title found"
+                    title_tag = soup.find('title')
+                    if title_tag:
+                        title = title_tag.get_text().strip()
+                    else:
+                        # Try meta title
+                        meta_title = soup.find('meta', property='og:title')
+                        if meta_title:
+                            title = meta_title.get('content', '').strip()
                         else:
-                            # Try meta title
-                            meta_title = soup.find('meta', property='og:title')
-                            if meta_title:
-                                title = meta_title.get('content', '').strip()
+                            # Try h1 as last resort
+                            h1_tag = soup.find('h1')
+                            if h1_tag:
+                                title = h1_tag.get_text().strip()
                             else:
-                                # Try h1 as last resort
-                                h1_tag = soup.find('h1')
-                                if h1_tag:
-                                    title = h1_tag.get_text().strip()
-                                else:
-                                    title = f"Page from {urlparse(url).netloc}"
-                        
-                        # Remove unwanted elements more thoroughly
-                        unwanted_tags = [
-                            'script', 'style', 'nav', 'footer', 'header', 'aside', 
-                            'noscript', 'iframe', 'object', 'embed', 'applet',
-                            'link', 'meta', 'base', 'comment'
-                        ]
-                        
-                        for tag_name in unwanted_tags:
-                            for tag in soup.find_all(tag_name):
-                                tag.decompose()
-                        
-                        # Remove comments
-                        for comment in soup.find_all(string=lambda text: isinstance(text, str) and text.strip().startswith('<!--')):
-                            comment.extract()
-                        
-                        # Try to extract main content more intelligently
-                        main_content = None
-                        
-                        # Look for main content containers
-                        main_selectors = [
-                            'main', '[role="main"]', '.main-content', '#main-content',
-                            '.content', '#content', '.post-content', '.entry-content',
-                            'article', '.article', '.post', '.entry'
-                        ]
-                        
-                        for selector in main_selectors:
-                            main_container = soup.select_one(selector)
-                            if main_container:
-                                main_content = main_container.get_text(separator=' ', strip=True)
-                                break
-                        
-                        # Fallback to body content if no main content found
-                        if not main_content:
-                            body = soup.find('body')
-                            if body:
-                                main_content = body.get_text(separator=' ', strip=True)
-                            else:
-                                main_content = soup.get_text(separator=' ', strip=True)
-                        
-                        # Clean up content
-                        content = re.sub(r'\s+', ' ', main_content)
-                        content = content.strip()
-                        
-                        # Enhanced content validation
-                        word_count = len(content.split())
-                        
-                        if word_count < 100:
-                            logger.warning(f"Content too short for meaningful analysis: {url} ({word_count} words)")
-                            return None
-                        
-                        # Check for duplicate/spam content patterns
-                        words = content.lower().split()
-                        unique_words = set(words)
-                        if len(unique_words) < len(words) * 0.3:  # Less than 30% unique words
-                            logger.warning(f"Content appears to be repetitive/spam for {url}")
-                            return None
-                        
-                        logger.info(f"Successfully scraped {word_count} words from {url}")
-                        
-                        return {
-                            'url': url,
-                            'title': title[:200],  # Limit title length
-                            'content': content,
-                            'word_count': word_count
-                        }
-                        
-                except aiohttp.ClientConnectorError as e:
+                                title = f"Page from {urlparse(url).netloc}"
+                    
+                    # Remove unwanted elements more thoroughly
+                    unwanted_tags = [
+                        'script', 'style', 'nav', 'footer', 'header', 'aside', 
+                        'noscript', 'iframe', 'object', 'embed', 'applet',
+                        'link', 'meta', 'base', 'comment'
+                    ]
+                    
+                    for tag_name in unwanted_tags:
+                        for tag in soup.find_all(tag_name):
+                            tag.decompose()
+                    
+                    # Remove comments
+                    for comment in soup.find_all(string=lambda text: isinstance(text, str) and text.strip().startswith('<!--')):
+                        comment.extract()
+                    
+                    # Try to extract main content more intelligently
+                    main_content = None
+                    
+                    # Look for main content containers
+                    main_selectors = [
+                        'main', '[role="main"]', '.main-content', '#main-content',
+                        '.content', '#content', '.post-content', '.entry-content',
+                        'article', '.article', '.post', '.entry'
+                    ]
+                    
+                    for selector in main_selectors:
+                        main_container = soup.select_one(selector)
+                        if main_container:
+                            main_content = main_container.get_text(separator=' ', strip=True)
+                            break
+                    
+                    # Fallback to body content if no main content found
+                    if not main_content:
+                        body = soup.find('body')
+                        if body:
+                            main_content = body.get_text(separator=' ', strip=True)
+                        else:
+                            main_content = soup.get_text(separator=' ', strip=True)
+                    
+                    # Clean up content
+                    content = re.sub(r'\s+', ' ', main_content)
+                    content = content.strip()
+                    
+                    # Enhanced content validation
+                    word_count = len(content.split())
+                    
+                    if word_count < 100:
+                        logger.warning(f"Content too short for meaningful analysis: {url} ({word_count} words)")
+                        return None
+                    
+                    # Check for duplicate/spam content patterns
+                    words = content.lower().split()
+                    unique_words = set(words)
+                    if len(unique_words) < len(words) * 0.3:  # Less than 30% unique words
+                        logger.warning(f"Content appears to be repetitive/spam for {url}")
+                        return None
+                    
+                    logger.info(f"Successfully scraped {word_count} words from {url}")
+                    
+                    return {
+                        'url': url,
+                        'title': title[:200],  # Limit title length
+                        'content': content,
+                        'word_count': word_count
+                    }
+                    
+                except httpx.ConnectError as e:
                     logger.error(f"Connection error for {url}: {str(e)}")
                     return None
-                except aiohttp.ServerTimeoutError:
-                    logger.error(f"Server timeout for {url}")
+                except httpx.TimeoutException:
+                    logger.error(f"Timeout error for {url}")
                     return None
-                except asyncio.TimeoutError:
-                    logger.error(f"Request timeout for {url}")
-                    return None
-                except aiohttp.ClientResponseError as e:
-                    logger.error(f"HTTP response error for {url}: {e.status} - {e.message}")
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"HTTP status error for {url}: {e.response.status_code}")
                     return None
                 except Exception as e:
                     logger.error(f"Unexpected error scraping {url}: {str(e)}")
@@ -299,7 +290,7 @@ class AIEntityAnalyzer:
             Focus on entities that are relevant for SEO and content strategy.
             """
             
-            response = await self.client.chat.completions.create(
+            response = await self.openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": "You are an expert SEO content analyst. Provide accurate, structured analysis in JSON format."},
@@ -448,7 +439,7 @@ class AIEntityAnalyzer:
                 Focus on natural integration that adds value to users while improving SEO.
                 """
                 
-                response = await self.client.chat.completions.create(
+                response = await self.openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": "You are an expert SEO content strategist. Provide specific, actionable recommendations."},
